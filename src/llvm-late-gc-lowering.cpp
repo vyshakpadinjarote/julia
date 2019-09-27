@@ -570,7 +570,10 @@ bool LateLowerGCFrame::LiftSelect(State &S, SelectInst *SI) {
             else
                 FalseElem = V_null;
             if (TrueElem != V_null || FalseElem != V_null) {
-                SelectInst *SelectBase = SelectInst::Create(SI->getCondition(), TrueElem, FalseElem, "gclift", SI);
+                Value *Cond = SI->getCondition();
+                if (isa<VectorType>(Cond->getType()))
+                    Cond = MaybeExtractUnion(std::make_pair(Cond, i), SI);
+                SelectInst *SelectBase = SelectInst::Create(Cond, TrueElem, FalseElem, "gclift", SI);
                 int Number = ++S.MaxPtrNumber;
                 S.AllPtrNumbering[SelectBase] = Number;
                 S.ReversePtrNumbering[Number] = SelectBase;

@@ -486,12 +486,82 @@ top:
     %ptls = call %jl_value_t*** @julia.ptls_states()
     %loaded = load <2 x %jl_value_t addrspace(10)*>, <2 x %jl_value_t addrspace(10)*> *%arg
     call void @jl_safepoint()
-    %select = select i1 %cond, <2 x %jl_value_t addrspace(10)*> zeroinitializer, <2 x %jl_value_t addrspace(10)*>  %loaded
+    %select = select i1 %cond, <2 x %jl_value_t addrspace(10)*> zeroinitializer, <2 x %jl_value_t addrspace(10)*> %loaded
     call void @jl_safepoint()
     %el1 = extractelement <2 x %jl_value_t addrspace(10)*> %select, i32 0
     %el2 = extractelement <2 x %jl_value_t addrspace(10)*> %select, i32 1
     call void @one_arg_boxed(%jl_value_t addrspace(10)* %el1)
     call void @one_arg_boxed(%jl_value_t addrspace(10)* %el2)
+    unreachable
+}
+
+define void @vecselect_lift(i1 %cond, <2 x %jl_value_t addrspace(10)*> *%arg) {
+; CHECK-LABEL: @vecselect_lift
+; CHECK: %gcframe = alloca %jl_value_t addrspace(10)*, i32 4
+    %ptls = call %jl_value_t*** @julia.ptls_states()
+    %loaded = load <2 x %jl_value_t addrspace(10)*>, <2 x %jl_value_t addrspace(10)*> *%arg
+    %decayed = addrspacecast <2 x %jl_value_t addrspace(10)*> %loaded to <2 x i64 addrspace(12)*>
+    call void @jl_safepoint()
+; CHECK: %gclift = select i1 %cond, %jl_value_t addrspace(10)* null, %jl_value_t addrspace(10)* %{{[0-9]+}}
+    %select = select i1 %cond, <2 x i64 addrspace(12)*> zeroinitializer, <2 x i64 addrspace(12)*> %decayed
+    call void @jl_safepoint()
+    %el1 = extractelement <2 x i64 addrspace(12)*> %select, i32 0
+    %el2 = extractelement <2 x i64 addrspace(12)*> %select, i32 1
+    call void @one_arg_decayed(i64 addrspace(12)* %el1)
+    call void @one_arg_decayed(i64 addrspace(12)* %el2)
+    unreachable
+}
+
+define void @vecvecselect_lift(<2 x i1> %cond, <2 x %jl_value_t addrspace(10)*> *%arg) {
+; CHECK-LABEL: @vecvecselect_lift
+; CHECK: %gcframe = alloca %jl_value_t addrspace(10)*, i32 4
+    %ptls = call %jl_value_t*** @julia.ptls_states()
+    %loaded = load <2 x %jl_value_t addrspace(10)*>, <2 x %jl_value_t addrspace(10)*> *%arg
+    %decayed = addrspacecast <2 x %jl_value_t addrspace(10)*> %loaded to <2 x i64 addrspace(12)*>
+    call void @jl_safepoint()
+; CHECK: %gclift = select i1 %{{[0-9]+}}, %jl_value_t addrspace(10)* null, %jl_value_t addrspace(10)* %{{[0-9]+}}
+    %select = select <2 x i1> %cond, <2 x i64 addrspace(12)*> zeroinitializer, <2 x i64 addrspace(12)*> %decayed
+    call void @jl_safepoint()
+    %el1 = extractelement <2 x i64 addrspace(12)*> %select, i32 0
+    %el2 = extractelement <2 x i64 addrspace(12)*> %select, i32 1
+    call void @one_arg_decayed(i64 addrspace(12)* %el1)
+    call void @one_arg_decayed(i64 addrspace(12)* %el2)
+    unreachable
+}
+
+define void @vecscalarselect_lift(<2 x i1> %cond, i64 %a) {
+; CHECK-LABEL: @vecscalarselect_lift
+; CHECK: %gcframe = alloca %jl_value_t addrspace(10)*, i32 4
+    %ptls = call %jl_value_t*** @julia.ptls_states()
+    %aboxed = call %jl_value_t addrspace(10)* @jl_box_int64(i64 signext %a)
+    %adecayed = addrspacecast %jl_value_t addrspace(10)* %aboxed to i64 addrspace(12)*
+    %avec = getelementptr i64, i64 addrspace(12)*  %adecayed, <2 x i32> zeroinitializer
+    call void @jl_safepoint()
+; CHECK: %gclift = select i1 %{{[0-9]+}}, %jl_value_t addrspace(10)* null, %jl_value_t addrspace(10)* %aboxed
+    %select = select <2 x i1> %cond, <2 x i64 addrspace(12)*> zeroinitializer, <2 x i64 addrspace(12)*> %avec
+    call void @jl_safepoint()
+    %el1 = extractelement <2 x i64 addrspace(12)*> %select, i32 0
+    %el2 = extractelement <2 x i64 addrspace(12)*> %select, i32 1
+    call void @one_arg_decayed(i64 addrspace(12)* %el1)
+    call void @one_arg_decayed(i64 addrspace(12)* %el2)
+    unreachable
+}
+
+define void @scalarvecselect_lift(i1 %cond, i64 %a) {
+; CHECK-LABEL: @scalarvecselect_lift
+; CHECK: %gcframe = alloca %jl_value_t addrspace(10)*, i32 4
+    %ptls = call %jl_value_t*** @julia.ptls_states()
+    %aboxed = call %jl_value_t addrspace(10)* @jl_box_int64(i64 signext %a)
+    %adecayed = addrspacecast %jl_value_t addrspace(10)* %aboxed to i64 addrspace(12)*
+    %avec = getelementptr i64, i64 addrspace(12)*  %adecayed, <2 x i32> zeroinitializer
+    call void @jl_safepoint()
+; CHECK: %gclift = select i1 %cond, %jl_value_t addrspace(10)* null, %jl_value_t addrspace(10)* %aboxed
+    %select = select i1 %cond, <2 x i64 addrspace(12)*> zeroinitializer, <2 x i64 addrspace(12)*> %avec
+    call void @jl_safepoint()
+    %el1 = extractelement <2 x i64 addrspace(12)*> %select, i32 0
+    %el2 = extractelement <2 x i64 addrspace(12)*> %select, i32 1
+    call void @one_arg_decayed(i64 addrspace(12)* %el1)
+    call void @one_arg_decayed(i64 addrspace(12)* %el2)
     unreachable
 }
 
