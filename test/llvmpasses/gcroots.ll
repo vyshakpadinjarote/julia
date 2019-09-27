@@ -51,8 +51,8 @@ define void @simple_union() {
     %ptls = call %jl_value_t*** @julia.ptls_states()
 ; CHECK: %a = call { %jl_value_t addrspace(10)*, i8 } @union_ret()
     %a = call { %jl_value_t addrspace(10)*, i8 } @union_ret()
-; CHECK: [[GEP0:%.*]] = getelementptr %jl_value_t addrspace(10)*, %jl_value_t addrspace(10)** %gcframe, i32 [[GEPSLOT0:[0-9]+]]
 ; CHECK-NEXT: [[EXTRACT:%.*]] = extractvalue { %jl_value_t addrspace(10)*, i8 } %a, 0
+; CHECK: [[GEP0:%.*]] = getelementptr %jl_value_t addrspace(10)*, %jl_value_t addrspace(10)** %gcframe, i32 [[GEPSLOT0:[0-9]+]]
 ; CHECK-NEXT: store %jl_value_t addrspace(10)* [[EXTRACT]], %jl_value_t addrspace(10)** [[GEP0]]
     call void @union_arg({%jl_value_t addrspace(10)*, i8} %a)
     ret void
@@ -112,6 +112,7 @@ define void @select_lift(i64 %a, i64 %b) {
 define void @phi_lift(i64 %a, i64 %b) {
 top:
 ; CHECK-LABEL: @phi_lift
+; CHECK: %gclift = phi %jl_value_t addrspace(10)* [ %aboxed, %alabel ], [ %bboxed, %blabel ], [ %gclift, %common ]
     %ptls = call %jl_value_t*** @julia.ptls_states()
     %cmp = icmp eq i64 %a, %b
     br i1 %cmp, label %alabel, label %blabel
@@ -124,10 +125,11 @@ blabel:
     %bdecayed = addrspacecast %jl_value_t addrspace(10)* %bboxed to i64 addrspace(12)*
     br label %common
 common:
-    %phi = phi i64 addrspace(12)* [ %adecayed, %alabel ], [ %bdecayed, %blabel ]
+    %phi = phi i64 addrspace(12)* [ %adecayed, %alabel ], [ %bdecayed, %blabel ], [ %phi, %common ]
     call void @one_arg_decayed(i64 addrspace(12)* %phi)
-    ret void
+    br label %common
 }
+
 
 define void @phi_lift_union(i64 %a, i64 %b) {
 top:

@@ -324,7 +324,6 @@ private:
     void NoteUse(State &S, BBState &BBS, Value *V) {
         NoteUse(S, BBS, V, BBS.UpExposedUses);
     }
-    Value *MaybeExtractUnion(std::pair<Value*,int> Val, Instruction *InsertBefore);
     void LiftPhi(State &S, PHINode *Phi, SmallVector<int, 8> &PHINumbers);
     bool LiftSelect(State &S, SelectInst *SI);
     int Number(State &S, Value *V);
@@ -472,14 +471,15 @@ static std::pair<Value*,int> FindBaseValue(const State &S, Value *V, bool UseCac
     return std::make_pair(CurrentV, fld_idx);
 }
 
-Value *LateLowerGCFrame::MaybeExtractUnion(std::pair<Value*,int> Val, Instruction *InsertBefore) {
+static Value *MaybeExtractUnion(std::pair<Value*,int> Val, Instruction *InsertBefore) {
     if (isUnionRep(Val.first->getType())) {
         assert(Val.second == -1);
         return ExtractValueInst::Create(Val.first, {(unsigned)0}, "", InsertBefore);
     }
     else if (Val.second != -1) {
-        return ExtractElementInst::Create(Val.first, ConstantInt::get(T_int32, Val.second),
-                                          "", InsertBefore);
+        return ExtractElementInst::Create(Val.first,
+                ConstantInt::get(Type::getInt32Ty(Val.first->getContext()), Val.second),
+                "", InsertBefore);
     }
     return Val.first;
 }
@@ -487,17 +487,16 @@ Value *LateLowerGCFrame::MaybeExtractUnion(std::pair<Value*,int> Val, Instructio
 static Value *GetPtrForNumber(State &S, unsigned Num, Instruction *InsertionPoint)
 {
     Value *Val = S.ReversePtrNumbering[Num];
+    unsigned Idx = -1;
     if (isSpecialPtrVec(Val->getType())) {
         const std::vector<int> &AllNums = S.AllVectorNumbering[Val];
-        unsigned Idx = 0;
-        for (; Idx < AllNums.size(); ++Idx) {
+        for (Idx = 0; Idx < AllNums.size(); ++Idx) {
             if ((unsigned)AllNums[Idx] == Num)
                 break;
         }
-        Val = ExtractElementInst::Create(Val, ConstantInt::get(
-            Type::getInt32Ty(Val->getContext()), Idx), "", InsertionPoint);
+        assert(Idx < AllNums.size());
     }
-    return Val;
+    return MaybeExtractUnion(std::make_pair(Val, Idx), InsertionPoint);
 }
 
 bool LateLowerGCFrame::LiftSelect(State &S, SelectInst *SI) {
@@ -519,8 +518,13 @@ bool LateLowerGCFrame::LiftSelect(State &S, SelectInst *SI) {
     std::vector<int> TrueNumbers;
     std::vector<int> FalseNumbers;
     if (isa<PointerType>(TrueBase->getType())) {
-        if (!isTrackedValue(TrueBase))
-            TrueBase = V_null;
+        if (!isTrackedValue(TrueBase)) {
+            int BaseNumber = NumberBase(S, SI->getTrueValue(), TrueBase);
+            if (BaseNumber >= 0)
+                TrueBase = GetPtrForNumber(S, BaseNumber, SI);
+            else
+                TrueBase = V_null;
+        }
     } else {
         TrueNumbers = NumberVectorBase(S, TrueBase);
         assert(TrueNumbers.size() == Numbers.size());
@@ -528,13 +532,24 @@ bool LateLowerGCFrame::LiftSelect(State &S, SelectInst *SI) {
         S.AllVectorNumbering[SI->getTrueValue()] = TrueNumbers;
     }
     if (isa<PointerType>(FalseBase->getType())) {
-        if (!isTrackedValue(FalseBase))
-            FalseBase = V_null;
+        if (!isTrackedValue(FalseBase)) {
+            int BaseNumber = NumberBase(S, SI->getFalseValue(), FalseBase);
+            if (BaseNumber >= 0)
+                FalseBase = GetPtrForNumber(S, BaseNumber, SI);
+            else
+                FalseBase = V_null;
+        }
     } else {
         FalseNumbers = NumberVectorBase(S, FalseBase);
         assert(FalseNumbers.size() == Numbers.size());
         NumRoots = TrueNumbers.size();
         S.AllVectorNumbering[SI->getFalseValue()] = FalseNumbers;
+    }
+    if (isa<PointerType>(SI->getType()) ?
+            S.AllPtrNumbering.count(SI) :
+            S.AllVectorNumbering.count(SI)) {
+        // NumberBase or NumberVectorBase handled this for us (recursively, though a PHINode)
+        return true;
     }
     bool didsplit = false;
     if (TrueBase != V_null && FalseBase != V_null) {
@@ -590,9 +605,23 @@ void LateLowerGCFrame::LiftPhi(State &S, PHINode *Phi, SmallVector<int, 8> &PHIN
         NumRoots = Phi->getType()->getVectorNumElements();
     // need to handle each element (may just be one scalar)
     SmallVector<PHINode *, 2> lifted;
+    std::vector<int> Numbers;
+    if (!isa<PointerType>(Phi->getType()))
+        Numbers.resize(NumRoots);
     for (unsigned i = 0; i < NumRoots; ++i) {
-        lifted.push_back(PHINode::Create(T_prjlvalue, Phi->getNumIncomingValues(), "gclift", Phi));
+        PHINode *lift = PHINode::Create(T_prjlvalue, Phi->getNumIncomingValues(), "gclift", Phi);
+        int Number = ++S.MaxPtrNumber;
+        PHINumbers.push_back(Number);
+        S.AllPtrNumbering[lift] = Number;
+        S.ReversePtrNumbering[Number] = lift;
+        if (!isa<VectorType>(Phi->getType()))
+            S.AllPtrNumbering[Phi] = Number;
+        else
+            Numbers[i] = Number;
+        lifted.push_back(lift);
     }
+    if (!isa<PointerType>(Phi->getType()))
+        S.AllVectorNumbering[Phi] = Numbers;
     Value *V_null = ConstantPointerNull::get(cast<PointerType>(T_prjlvalue));
     for (unsigned i = 0; i < Phi->getNumIncomingValues(); ++i) {
         Value *Incoming = Phi->getIncomingValue(i);
@@ -600,9 +629,14 @@ void LateLowerGCFrame::LiftPhi(State &S, PHINode *Phi, SmallVector<int, 8> &PHIN
         Instruction *Terminator = IncomingBB->getTerminator();
         if (!isa<VectorType>(Phi->getType())) {
             Value *Base = MaybeExtractUnion(FindBaseValue(S, Incoming, false), Terminator);
-            if (!isTrackedValue(Base))
-                Base = V_null;
-            else if (Base->getType() != T_prjlvalue)
+            if (!isTrackedValue(Base)) {
+                int BaseNumber = NumberBase(S, Incoming,  Base);
+                if (BaseNumber >= 0)
+                    Base = GetPtrForNumber(S, BaseNumber, Terminator);
+                else
+                    Base = V_null;
+            }
+            if (Base->getType() != T_prjlvalue)
                 Base = new BitCastInst(Base, T_prjlvalue, "", Terminator);
             PHINode *lift = lifted[0];
             lift->addIncoming(Base, IncomingBB);
@@ -617,22 +651,6 @@ void LateLowerGCFrame::LiftPhi(State &S, PHINode *Phi, SmallVector<int, 8> &PHIN
             }
         }
     }
-    std::vector<int> Numbers;
-    if (!isa<PointerType>(Phi->getType()))
-        Numbers.resize(NumRoots);
-    for (unsigned i = 0; i < NumRoots; ++i) {
-        PHINode *lift = lifted[i];
-        int Number = ++S.MaxPtrNumber;
-        PHINumbers.push_back(Number);
-        S.AllPtrNumbering[lift] = Number;
-        S.ReversePtrNumbering[Number] = lift;
-        if (!isa<VectorType>(Phi->getType()))
-            S.AllPtrNumbering[Phi] = Number;
-        else
-            Numbers[i] = Number;
-    }
-    if (!isa<PointerType>(Phi->getType()))
-        S.AllVectorNumbering[Phi] = Numbers;
 }
 
 int LateLowerGCFrame::NumberBase(State &S, Value *V, Value *CurrentV)
