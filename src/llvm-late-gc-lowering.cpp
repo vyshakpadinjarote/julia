@@ -354,6 +354,12 @@ static unsigned getValueAddrSpace(Value *V) {
     return V->getType()->getScalarType()->getPointerAddressSpace();
 }
 
+static unsigned isTrackedValue(Value *V) {
+    PointerType *PT = dyn_cast<PointerType>(V->getType()->getScalarType());
+    return PT && PT->getAddressSpace() == AddressSpace::Tracked;
+}
+
+
 static bool isSpecialPtr(Type *Ty) {
     PointerType *PTy = dyn_cast<PointerType>(Ty);
     if (!PTy)
@@ -495,89 +501,138 @@ static Value *GetPtrForNumber(State &S, unsigned Num, Instruction *InsertionPoin
 }
 
 bool LateLowerGCFrame::LiftSelect(State &S, SelectInst *SI) {
-    if (isSpecialPtrVec(SI->getType())) {
-        VectorType *VT = cast<VectorType>(SI->getType());
-        std::vector<int> TrueNumbers = NumberVector(S, SI->getTrueValue());
-        std::vector<int> FalseNumbers = NumberVector(S, SI->getFalseValue());
-        std::vector<int> Numbers;
-        for (unsigned i = 0; i < VT->getNumElements(); ++i) {
-            SelectInst *LSI = SelectInst::Create(SI->getCondition(),
-              TrueNumbers[i] < 0 ?
-                ConstantPointerNull::get(cast<PointerType>(T_prjlvalue)) :
-                GetPtrForNumber(S, TrueNumbers[i], SI),
-              FalseNumbers[i] < 0 ?
-                ConstantPointerNull::get(cast<PointerType>(T_prjlvalue)) :
-                GetPtrForNumber(S, FalseNumbers[i], SI),
-              "gclift", SI);
-            int Number = ++S.MaxPtrNumber;
-            Numbers.push_back(Number);
-            S.AllPtrNumbering[LSI] = Number;
-            S.ReversePtrNumbering[Number] = LSI;
-        }
-        S.AllVectorNumbering[SI] = Numbers;
-    } else {
-        Value *TrueBase = MaybeExtractUnion(FindBaseValue(S, SI->getTrueValue(), false), SI);
-        Value *FalseBase = MaybeExtractUnion(FindBaseValue(S, SI->getFalseValue(), false), SI);
-        if (getValueAddrSpace(TrueBase) != AddressSpace::Tracked)
-            TrueBase = ConstantPointerNull::get(cast<PointerType>(FalseBase->getType()));
-        if (getValueAddrSpace(FalseBase) != AddressSpace::Tracked)
-            FalseBase = ConstantPointerNull::get(cast<PointerType>(TrueBase->getType()));
-        if (getValueAddrSpace(TrueBase) != AddressSpace::Tracked)
-            return false;
-        Value *SelectBase = SelectInst::Create(SI->getCondition(),
-            TrueBase, FalseBase, "gclift", SI);
-        int Number = ++S.MaxPtrNumber;
-        S.AllPtrNumbering[SelectBase] = S.AllPtrNumbering[SI] = Number;
-        S.ReversePtrNumbering[Number] = SelectBase;
+    if (isa<PointerType>(SI->getType()) ?
+            S.AllPtrNumbering.count(SI) :
+            S.AllVectorNumbering.count(SI)) {
+        // already visited here--nothing to do
+        return true;
     }
-    return true;
+    assert(!isTrackedValue(SI));
+    // find the base root for the arguments
+    Value *TrueBase = MaybeExtractUnion(FindBaseValue(S, SI->getTrueValue(), false), SI);
+    Value *FalseBase = MaybeExtractUnion(FindBaseValue(S, SI->getFalseValue(), false), SI);
+    Value *V_null = ConstantPointerNull::get(cast<PointerType>(T_prjlvalue));
+    std::vector<int> Numbers;
+    unsigned NumRoots = 1;
+    if (isa<VectorType>(SI->getType()))
+        Numbers.resize(SI->getType()->getVectorNumElements(), -1);
+    std::vector<int> TrueNumbers;
+    std::vector<int> FalseNumbers;
+    if (isa<PointerType>(TrueBase->getType())) {
+        if (!isTrackedValue(TrueBase))
+            TrueBase = V_null;
+    } else {
+        TrueNumbers = NumberVectorBase(S, TrueBase);
+        assert(TrueNumbers.size() == Numbers.size());
+        NumRoots = TrueNumbers.size();
+        S.AllVectorNumbering[SI->getTrueValue()] = TrueNumbers;
+    }
+    if (isa<PointerType>(FalseBase->getType())) {
+        if (!isTrackedValue(FalseBase))
+            FalseBase = V_null;
+    } else {
+        FalseNumbers = NumberVectorBase(S, FalseBase);
+        assert(FalseNumbers.size() == Numbers.size());
+        NumRoots = TrueNumbers.size();
+        S.AllVectorNumbering[SI->getFalseValue()] = FalseNumbers;
+    }
+    bool didsplit = false;
+    if (TrueBase != V_null && FalseBase != V_null) {
+        // need to handle each element (may just be one scalar)
+        for (unsigned i = 0; i < NumRoots; ++i) {
+            Value *TrueElem;
+            if (isa<PointerType>(TrueBase->getType()))
+                TrueElem = TrueBase;
+            else if (TrueNumbers[i] >= 0)
+                TrueElem = GetPtrForNumber(S, TrueNumbers[i], SI);
+            else
+                TrueElem = V_null;
+            Value *FalseElem;
+            if (isa<PointerType>(FalseBase->getType()))
+                FalseElem = FalseBase;
+            else if (FalseNumbers[i] >= 0)
+                FalseElem = GetPtrForNumber(S, FalseNumbers[i], SI);
+            else
+                FalseElem = V_null;
+            if (TrueElem != V_null || FalseElem != V_null) {
+                SelectInst *SelectBase = SelectInst::Create(SI->getCondition(), TrueElem, FalseElem, "gclift", SI);
+                int Number = ++S.MaxPtrNumber;
+                S.AllPtrNumbering[SelectBase] = Number;
+                S.ReversePtrNumbering[Number] = SelectBase;
+                if (isa<PointerType>(SI->getType()))
+                   S.AllPtrNumbering[SI] = Number;
+                else
+                    Numbers[i] = Number;
+                didsplit = true;
+            }
+        }
+        if (isa<VectorType>(SI->getType()) && NumRoots != Numbers.size()) {
+            // broadcast the scalar root number to fill the vector
+            assert(NumRoots == 1);
+            int Number = Numbers[0];
+            Numbers.resize(0);
+            Numbers.resize(SI->getType()->getVectorNumElements(), Number);
+        }
+    }
+    if (isa<VectorType>(SI->getType()))
+        S.AllVectorNumbering[SI] = Numbers;
+    return didsplit;
 }
 
 void LateLowerGCFrame::LiftPhi(State &S, PHINode *Phi, SmallVector<int, 8> &PHINumbers)
 {
-    if (isSpecialPtrVec(Phi->getType())) {
-        VectorType *VT = cast<VectorType>(Phi->getType());
-        std::vector<PHINode *> lifted;
-        for (unsigned i = 0; i < VT->getNumElements(); ++i) {
-            lifted.push_back(PHINode::Create(T_prjlvalue, Phi->getNumIncomingValues(), "gclift", Phi));
-        }
-        for (unsigned i = 0; i < Phi->getNumIncomingValues(); ++i) {
-            std::vector<int> Numbers = NumberVector(S, Phi->getIncomingValue(i));
-            BasicBlock *IncomingBB = Phi->getIncomingBlock(i);
-            Instruction *Terminator = IncomingBB->getTerminator();
-            for (unsigned i = 0; i < VT->getNumElements(); ++i) {
-                if (Numbers[i] < 0)
-                    lifted[i]->addIncoming(ConstantPointerNull::get(cast<PointerType>(T_prjlvalue)), IncomingBB);
-                else
-                    lifted[i]->addIncoming(GetPtrForNumber(S, Numbers[i], Terminator), IncomingBB);
+    if (isSpecialPtrVec(Phi->getType()) ?
+            S.AllVectorNumbering.count(Phi) :
+            S.AllPtrNumbering.count(Phi))
+        return;
+    unsigned NumRoots = 1;
+    if (isa<VectorType>(Phi->getType()))
+        NumRoots = Phi->getType()->getVectorNumElements();
+    // need to handle each element (may just be one scalar)
+    SmallVector<PHINode *, 2> lifted;
+    for (unsigned i = 0; i < NumRoots; ++i) {
+        lifted.push_back(PHINode::Create(T_prjlvalue, Phi->getNumIncomingValues(), "gclift", Phi));
+    }
+    Value *V_null = ConstantPointerNull::get(cast<PointerType>(T_prjlvalue));
+    for (unsigned i = 0; i < Phi->getNumIncomingValues(); ++i) {
+        Value *Incoming = Phi->getIncomingValue(i);
+        BasicBlock *IncomingBB = Phi->getIncomingBlock(i);
+        Instruction *Terminator = IncomingBB->getTerminator();
+        if (!isa<VectorType>(Phi->getType())) {
+            Value *Base = MaybeExtractUnion(FindBaseValue(S, Incoming, false), Terminator);
+            if (!isTrackedValue(Base))
+                Base = V_null;
+            else if (Base->getType() != T_prjlvalue)
+                Base = new BitCastInst(Base, T_prjlvalue, "", Terminator);
+            PHINode *lift = lifted[0];
+            lift->addIncoming(Base, IncomingBB);
+        } else {
+            std::vector<int> IncomingNumbers = NumberVectorBase(S, Incoming);
+            for (unsigned i = 0; i < NumRoots; ++i) {
+                PHINode *lift = lifted[i];
+                Value *Base = V_null;
+                if (IncomingNumbers[i] >= 0)
+                    Base = GetPtrForNumber(S, IncomingNumbers[i], Terminator);
+                lift->addIncoming(Base, IncomingBB);
             }
         }
-        std::vector<int> Numbers;
-        for (unsigned i = 0; i < VT->getNumElements(); ++i) {
-            int Number = ++S.MaxPtrNumber;
-            PHINumbers.push_back(Number);
-            Numbers.push_back(Number);
-            S.AllPtrNumbering[lifted[i]] = Number;
-            S.ReversePtrNumbering[Number] = lifted[i];
-        }
-        S.AllVectorNumbering[Phi] = Numbers;
-    } else {
-        PHINode *lift = PHINode::Create(T_prjlvalue, Phi->getNumIncomingValues(), "gclift", Phi);
-        for (unsigned i = 0; i < Phi->getNumIncomingValues(); ++i) {
-            Value *Incoming = Phi->getIncomingValue(i);
-            Value *Base = MaybeExtractUnion(FindBaseValue(S, Incoming, false),
-                                            Phi->getIncomingBlock(i)->getTerminator());
-            if (getValueAddrSpace(Base) != AddressSpace::Tracked)
-                Base = ConstantPointerNull::get(cast<PointerType>(T_prjlvalue));
-            if (Base->getType() != T_prjlvalue)
-                Base = new BitCastInst(Base, T_prjlvalue, "", Phi->getIncomingBlock(i)->getTerminator());
-            lift->addIncoming(Base, Phi->getIncomingBlock(i));
-        }
+    }
+    std::vector<int> Numbers;
+    if (!isa<PointerType>(Phi->getType()))
+        Numbers.resize(NumRoots);
+    for (unsigned i = 0; i < NumRoots; ++i) {
+        PHINode *lift = lifted[i];
         int Number = ++S.MaxPtrNumber;
         PHINumbers.push_back(Number);
-        S.AllPtrNumbering[lift] = S.AllPtrNumbering[Phi] = Number;
+        S.AllPtrNumbering[lift] = Number;
         S.ReversePtrNumbering[Number] = lift;
+        if (!isa<VectorType>(Phi->getType()))
+            S.AllPtrNumbering[Phi] = Number;
+        else
+            Numbers[i] = Number;
     }
+    if (!isa<PointerType>(Phi->getType()))
+        S.AllVectorNumbering[Phi] = Numbers;
 }
 
 int LateLowerGCFrame::NumberBase(State &S, Value *V, Value *CurrentV)
@@ -592,19 +647,19 @@ int LateLowerGCFrame::NumberBase(State &S, Value *V, Value *CurrentV)
         Number = -2;
     } else if (isa<Argument>(CurrentV) ||
                ((isa<AllocaInst>(CurrentV) || isa<AddrSpaceCastInst>(CurrentV)) &&
-                getValueAddrSpace(CurrentV) != AddressSpace::Tracked)) {
+                !isTrackedValue(CurrentV))) {
         // We know this is rooted in the parent
         Number = -1;
     } else if (!isSpecialPtr(CurrentV->getType()) && !isUnion) {
         // Externally rooted somehow hopefully (otherwise there's a bug in the
         // input IR)
         Number = -1;
-    } else if (isa<SelectInst>(CurrentV) && !isUnion && getValueAddrSpace(CurrentV) != AddressSpace::Tracked) {
+    } else if (isa<SelectInst>(CurrentV) && !isUnion && !isTrackedValue(CurrentV)) {
         Number = -1;
-        if (LiftSelect(S, cast<SelectInst>(CurrentV)))
+        if (LiftSelect(S, cast<SelectInst>(CurrentV))) // lifting a scalar pointer
             Number = S.AllPtrNumbering[V] = S.AllPtrNumbering.at(CurrentV);
         return Number;
-    } else if (isa<PHINode>(CurrentV) && !isUnion && getValueAddrSpace(CurrentV) != AddressSpace::Tracked) {
+    } else if (isa<PHINode>(CurrentV) && !isUnion && !isTrackedValue(CurrentV)) {
         SmallVector<int, 8> PHINumbers;
         LiftPhi(S, cast<PHINode>(CurrentV), PHINumbers);
         Number = S.AllPtrNumbering[V] = S.AllPtrNumbering.at(CurrentV);
@@ -613,10 +668,7 @@ int LateLowerGCFrame::NumberBase(State &S, Value *V, Value *CurrentV)
         assert(false && "TODO: Extract");
         abort();
     } else {
-        assert(
-            (CurrentV->getType()->isPointerTy() &&
-                getValueAddrSpace(CurrentV) == AddressSpace::Tracked) ||
-            isUnion);
+        assert((CurrentV->getType()->isPointerTy() && isTrackedValue(CurrentV)) || isUnion);
         Number = ++S.MaxPtrNumber;
         S.ReversePtrNumbering[Number] = CurrentV;
     }
@@ -643,7 +695,7 @@ std::vector<int> LateLowerGCFrame::NumberVectorBase(State &S, Value *CurrentV) {
     if (isa<Constant>(CurrentV) ||
         ((isa<Argument>(CurrentV) || isa<AllocaInst>(CurrentV) ||
          isa<AddrSpaceCastInst>(CurrentV)) &&
-         getValueAddrSpace(CurrentV) != AddressSpace::Tracked)) {
+         !isTrackedValue(CurrentV))) {
         Numbers.resize(CurrentV->getType()->getVectorNumElements(), -1);
     }
     /* We (the frontend) don't insert either of these, but it would be legal -
@@ -666,10 +718,10 @@ std::vector<int> LateLowerGCFrame::NumberVectorBase(State &S, Value *CurrentV) {
         Numbers = NumberVectorBase(S, IEI->getOperand(0));
         int ElNumber = Number(S, IEI->getOperand(1));
         Numbers[idx] = ElNumber;
-    } else if (isa<SelectInst>(CurrentV) && getValueAddrSpace(CurrentV) != AddressSpace::Tracked) {
+    } else if (isa<SelectInst>(CurrentV) && !isTrackedValue(CurrentV)) {
         LiftSelect(S, cast<SelectInst>(CurrentV));
-        Numbers = S.AllVectorNumbering[CurrentV];
-    } else if (isa<PHINode>(CurrentV) && getValueAddrSpace(CurrentV) != AddressSpace::Tracked) {
+        Numbers = S.AllVectorNumbering.at(CurrentV);
+    } else if (isa<PHINode>(CurrentV) && !isTrackedValue(CurrentV)) {
         SmallVector<int, 8> PHINumbers;
         LiftPhi(S, cast<PHINode>(CurrentV), PHINumbers);
         Numbers = S.AllVectorNumbering[CurrentV];
@@ -737,8 +789,7 @@ void LateLowerGCFrame::MaybeNoteDef(State &S, BBState &BBS, Value *Def, const st
     int Num = -1;
     Type *RT = Def->getType();
     if (isSpecialPtr(RT)) {
-        assert(getValueAddrSpace(Def) == AddressSpace::Tracked &&
-            "Returned value of GC interest, but not tracked?");
+        assert(isTrackedValue(Def) && "Returned value of GC interest, but not tracked?");
         Num = Number(S, Def);
     }
     else if (isUnionRep(RT)) {
@@ -1182,30 +1233,11 @@ State LateLowerGCFrame::LocalScan(Function &F) {
                 }
                 NoteOperandUses(S, BBS, I);
             } else if (SelectInst *SI = dyn_cast<SelectInst>(&I)) {
-                // We need to insert an extra select for the GC root
-                if (!isSpecialPtr(SI->getType()) && !isSpecialPtrVec(SI->getType()) &&
-                    !isUnionRep(SI->getType()))
-                    continue;
-                if (!isUnionRep(SI->getType()) && getValueAddrSpace(SI) != AddressSpace::Tracked) {
-                    if (isSpecialPtrVec(SI->getType()) ?
-                        S.AllVectorNumbering.find(SI) != S.AllVectorNumbering.end() :
-                        S.AllPtrNumbering.find(SI) != S.AllPtrNumbering.end())
-                        continue;
-                    if (!LiftSelect(S, SI))
-                        continue;
-                    if (!isSpecialPtrVec(SI->getType())) {
-                        // TODO: Refinements for vector select
-                        int Num = S.AllPtrNumbering[SI];
-                        if (Num < 0)
-                            continue;
-                        auto SelectBase = cast<SelectInst>(S.ReversePtrNumbering[Num]);
-                        SmallVector<int, 2> RefinedPtr{Number(S, SelectBase->getTrueValue()),
-                                Number(S, SelectBase->getFalseValue())};
-                        S.Refinements[Num] = std::move(RefinedPtr);
-                    }
-                } else {
+                if (isUnionRep(SI->getType()) || isTrackedValue(SI)) {
+                    // record the select definition of these values
                     SmallVector<int, 2> RefinedPtr;
                     if (!isSpecialPtrVec(SI->getType())) {
+                        // TODO: Refinements for vector select
                         RefinedPtr = {
                             Number(S, SI->getTrueValue()),
                             Number(S, SI->getFalseValue())
@@ -1213,44 +1245,40 @@ State LateLowerGCFrame::LocalScan(Function &F) {
                     }
                     MaybeNoteDef(S, BBS, SI, BBS.Safepoints, std::move(RefinedPtr));
                     NoteOperandUses(S, BBS, I);
+                } else if (isSpecialPtr(SI->getType()) || isSpecialPtrVec(SI->getType())) {
+                    // We need to insert extra selects for the GC roots
+                    LiftSelect(S, SI);
                 }
             } else if (PHINode *Phi = dyn_cast<PHINode>(&I)) {
-                if (!isSpecialPtr(Phi->getType()) && !isSpecialPtrVec(Phi->getType()) &&
-                    !isUnionRep(Phi->getType())) {
-                    continue;
-                }
-                auto nIncoming = Phi->getNumIncomingValues();
-                // We need to insert an extra phi for the GC root
-                if (!isUnionRep(Phi->getType()) && getValueAddrSpace(Phi) != AddressSpace::Tracked) {
-                    if (isSpecialPtrVec(Phi->getType()) ?
-                        S.AllVectorNumbering.find(Phi) != S.AllVectorNumbering.end() :
-                        S.AllPtrNumbering.find(Phi) != S.AllPtrNumbering.end())
-                        continue;
-                    LiftPhi(S, Phi, PHINumbers);
-                } else {
+                if (isUnionRep(Phi->getType()) || isTrackedValue(Phi)) {
+                    // record the phi definition of these values
                     SmallVector<int, 1> PHIRefinements;
-                    if (!isSpecialPtrVec(Phi->getType()))
+                    if (isa<PointerType>(Phi->getType()))
                         PHIRefinements = GetPHIRefinements(Phi, S);
                     MaybeNoteDef(S, BBS, Phi, BBS.Safepoints, std::move(PHIRefinements));
-                    if (isSpecialPtrVec(Phi->getType())) {
+                    if (!isa<VectorType>(Phi->getType())) {
+                        PHINumbers.push_back(Number(S, Phi));
+                    } else {
                         // TODO: Vector refinements
                         std::vector<int> Nums = NumberVector(S, Phi);
                         for (int Num : Nums)
                             PHINumbers.push_back(Num);
-                    } else {
-                        PHINumbers.push_back(Number(S, Phi));
                     }
+                    unsigned nIncoming = Phi->getNumIncomingValues();
                     for (unsigned i = 0; i < nIncoming; ++i) {
                         BBState &IncomingBBS = S.BBStates[Phi->getIncomingBlock(i)];
                         NoteUse(S, IncomingBBS, Phi->getIncomingValue(i), IncomingBBS.PhiOuts);
                     }
+                } else if (isSpecialPtr(Phi->getType()) || isSpecialPtrVec(Phi->getType())) {
+                    // We need to insert extra phis for the GC roots
+                    LiftPhi(S, Phi, PHINumbers);
                 }
             } else if (isa<StoreInst>(&I)) {
                 NoteOperandUses(S, BBS, I);
             } else if (isa<ReturnInst>(&I)) {
                 NoteOperandUses(S, BBS, I);
             } else if (auto *ASCI = dyn_cast<AddrSpaceCastInst>(&I)) {
-                if (getValueAddrSpace(ASCI) == AddressSpace::Tracked) {
+                if (isTrackedValue(ASCI)) {
                     SmallVector<int, 1> RefinedPtr{};
                     auto origin = ASCI->getPointerOperand()->stripPointerCasts();
                     if (auto LI = dyn_cast<LoadInst>(origin)) {

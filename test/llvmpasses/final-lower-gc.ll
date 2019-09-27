@@ -28,6 +28,7 @@ top:
 ; CHECK-NEXT: [[GCFRAME_SIZE_PTR2:%.*]] = bitcast %jl_value_t addrspace(10)** [[GCFRAME_SIZE_PTR]] to i64*
 ; CHECK-NEXT: store i64 4, i64* [[GCFRAME_SIZE_PTR2]], !tbaa !0
 ; CHECK-NEXT: [[GCFRAME_SLOT:%.*]] = getelementptr %jl_value_t**, %jl_value_t*** %ptls, i32 0
+; XXX: ordering may be inconsistent, causing the test to fail here on some platforms
 ; CHECK-NEXT: [[PREV_GCFRAME_PTR:%.*]] = getelementptr %jl_value_t addrspace(10)*, %jl_value_t addrspace(10)** %gcframe, i32 1
 ; CHECK-NEXT: [[PREV_GCFRAME_PTR2:%.*]] = bitcast %jl_value_t addrspace(10)** [[PREV_GCFRAME_PTR]] to %jl_value_t***
 ; CHECK-NEXT: [[PREV_GCFRAME:%.*]] = load %jl_value_t**, %jl_value_t*** [[GCFRAME_SLOT]]
