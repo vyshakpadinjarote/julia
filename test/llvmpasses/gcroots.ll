@@ -51,8 +51,8 @@ define void @simple_union() {
     %ptls = call %jl_value_t*** @julia.ptls_states()
 ; CHECK: %a = call { %jl_value_t addrspace(10)*, i8 } @union_ret()
     %a = call { %jl_value_t addrspace(10)*, i8 } @union_ret()
-; CHECK-NEXT: [[EXTRACT:%.*]] = extractvalue { %jl_value_t addrspace(10)*, i8 } %a, 0
 ; CHECK: [[GEP0:%.*]] = getelementptr %jl_value_t addrspace(10)*, %jl_value_t addrspace(10)** %gcframe, i32 [[GEPSLOT0:[0-9]+]]
+; CHECK-NEXT: [[EXTRACT:%.*]] = extractvalue { %jl_value_t addrspace(10)*, i8 } %a, 0
 ; CHECK-NEXT: store %jl_value_t addrspace(10)* [[EXTRACT]], %jl_value_t addrspace(10)** [[GEP0]]
     call void @union_arg({%jl_value_t addrspace(10)*, i8} %a)
     ret void
