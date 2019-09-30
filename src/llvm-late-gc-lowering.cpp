@@ -620,14 +620,14 @@ void LateLowerGCFrame::LiftPhi(State &S, PHINode *Phi, SmallVector<int, 8> &PHIN
             S.AllVectorNumbering.count(Phi) :
             S.AllPtrNumbering.count(Phi))
         return;
-    unsigned NumRoots = 1;
-    if (isa<VectorType>(Phi->getType()))
-        NumRoots = Phi->getType()->getVectorNumElements();
     // need to handle each element (may just be one scalar)
     SmallVector<PHINode *, 2> lifted;
     std::vector<int> Numbers;
-    if (!isa<PointerType>(Phi->getType()))
+    unsigned NumRoots = 1;
+    if (isa<VectorType>(Phi->getType())) {
+        NumRoots = Phi->getType()->getVectorNumElements();
         Numbers.resize(NumRoots);
+    }
     for (unsigned i = 0; i < NumRoots; ++i) {
         PHINode *lift = PHINode::Create(T_prjlvalue, Phi->getNumIncomingValues(), "gclift", Phi);
         int Number = ++S.MaxPtrNumber;
@@ -646,18 +646,23 @@ void LateLowerGCFrame::LiftPhi(State &S, PHINode *Phi, SmallVector<int, 8> &PHIN
         Value *Incoming = Phi->getIncomingValue(i);
         BasicBlock *IncomingBB = Phi->getIncomingBlock(i);
         Instruction *Terminator = IncomingBB->getTerminator();
-        if (!isa<VectorType>(Phi->getType())) {
-            Value *Base = MaybeExtractScalar(S, FindBaseValue(S, Incoming, false), Terminator);
-            if (Base->getType() != T_prjlvalue)
-                Base = new BitCastInst(Base, T_prjlvalue, "", Terminator);
-            PHINode *lift = lifted[0];
-            lift->addIncoming(Base, IncomingBB);
-        } else {
-            std::vector<Value*> IncomingBases = MaybeExtractVector(S, Incoming, Terminator);
+        Value *Base = MaybeExtractScalar(S, FindBaseValue(S, Incoming, false), Terminator);
+        std::vector<Value*> IncomingBases;
+        if (!isa<PointerType>(Base->getType())) {
+            IncomingBases = MaybeExtractVector(S, Base, Terminator);
             assert(IncomingBases.size() == NumRoots);
-            for (unsigned i = 0; i < NumRoots; ++i) {
-                lifted[i]->addIncoming(IncomingBases[i], IncomingBB);
+        }
+        for (unsigned i = 0; i < NumRoots; ++i) {
+            PHINode *lift = lifted[i];
+            Value *BaseElem;
+            if (isa<PointerType>(Base->getType())) {
+                BaseElem = Base;
+                if (BaseElem->getType() != T_prjlvalue)
+                    BaseElem = new BitCastInst(BaseElem, T_prjlvalue, "", Terminator);
+            } else {
+                BaseElem = IncomingBases[i];
             }
+            lift->addIncoming(BaseElem, IncomingBB);
         }
     }
 }
@@ -711,7 +716,7 @@ int LateLowerGCFrame::Number(State &S, Value *V) {
         Number = NumberBase(S, CurrentV.first);
     } else {
         auto Numbers = NumberVectorBase(S, CurrentV.first);
-        Number = Numbers.size() == 0 ? -1 : Numbers[CurrentV.second];
+        Number = Numbers.size() == 0 ? -1 : Numbers.at(CurrentV.second);
     }
     if (V != CurrentV.first)
         S.AllPtrNumbering[V] = Number;
@@ -763,7 +768,8 @@ std::vector<int> LateLowerGCFrame::NumberVectorBase(State &S, Value *CurrentV) {
             S.ReversePtrNumbering[Num] = CurrentV;
         }
     } else {
-        assert(false && "Unexpected vector generating operation");
+        CurrentV->print(errs());
+        llvm_unreachable("Unexpected vector generating operation");
     }
     S.AllVectorNumbering[CurrentV] = Numbers;
     return Numbers;
