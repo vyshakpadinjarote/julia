@@ -324,7 +324,7 @@ private:
     void NoteUse(State &S, BBState &BBS, Value *V) {
         NoteUse(S, BBS, V, BBS.UpExposedUses);
     }
-    void LiftPhi(State &S, PHINode *Phi, SmallVector<int, 8> &PHINumbers);
+    void LiftPhi(State &S, PHINode *Phi);
     bool LiftSelect(State &S, SelectInst *SI);
     Value *MaybeExtractScalar(State &S, std::pair<Value*,int> ValExpr, Instruction *InsertBefore);
     std::vector<Value*> MaybeExtractVector(State &S, Value *BaseVec, Instruction *InsertBefore);
@@ -614,7 +614,7 @@ bool LateLowerGCFrame::LiftSelect(State &S, SelectInst *SI) {
     return didsplit;
 }
 
-void LateLowerGCFrame::LiftPhi(State &S, PHINode *Phi, SmallVector<int, 8> &PHINumbers)
+void LateLowerGCFrame::LiftPhi(State &S, PHINode *Phi)
 {
     if (isSpecialPtrVec(Phi->getType()) ?
             S.AllVectorNumbering.count(Phi) :
@@ -631,7 +631,6 @@ void LateLowerGCFrame::LiftPhi(State &S, PHINode *Phi, SmallVector<int, 8> &PHIN
     for (unsigned i = 0; i < NumRoots; ++i) {
         PHINode *lift = PHINode::Create(T_prjlvalue, Phi->getNumIncomingValues(), "gclift", Phi);
         int Number = ++S.MaxPtrNumber;
-        PHINumbers.push_back(Number);
         S.AllPtrNumbering[lift] = Number;
         S.ReversePtrNumbering[Number] = lift;
         if (!isa<VectorType>(Phi->getType()))
@@ -692,8 +691,7 @@ int LateLowerGCFrame::NumberBase(State &S, Value *CurrentV)
             Number = S.AllPtrNumbering.at(CurrentV);
         return Number;
     } else if (isa<PHINode>(CurrentV) && !isUnion && !isTrackedValue(CurrentV)) {
-        SmallVector<int, 8> PHINumbers;
-        LiftPhi(S, cast<PHINode>(CurrentV), PHINumbers);
+        LiftPhi(S, cast<PHINode>(CurrentV));
         Number = S.AllPtrNumbering.at(CurrentV);
         return Number;
     } else if (isa<ExtractValueInst>(CurrentV) && !isUnion) {
@@ -756,8 +754,7 @@ std::vector<int> LateLowerGCFrame::NumberVectorBase(State &S, Value *CurrentV) {
         LiftSelect(S, cast<SelectInst>(CurrentV));
         Numbers = S.AllVectorNumbering.at(CurrentV);
     } else if (isa<PHINode>(CurrentV) && !isTrackedValue(CurrentV)) {
-        SmallVector<int, 8> PHINumbers;
-        LiftPhi(S, cast<PHINode>(CurrentV), PHINumbers);
+        LiftPhi(S, cast<PHINode>(CurrentV));
         Numbers = S.AllVectorNumbering[CurrentV];
     } else if (isa<LoadInst>(CurrentV) || isa<CallInst>(CurrentV) || isa<PHINode>(CurrentV) ||
                isa<SelectInst>(CurrentV)) {
@@ -1305,7 +1302,7 @@ State LateLowerGCFrame::LocalScan(Function &F) {
                     }
                 } else if (isSpecialPtr(Phi->getType()) || isSpecialPtrVec(Phi->getType())) {
                     // We need to insert extra phis for the GC roots
-                    LiftPhi(S, Phi, PHINumbers);
+                    LiftPhi(S, Phi);
                 }
             } else if (isa<StoreInst>(&I)) {
                 NoteOperandUses(S, BBS, I);
